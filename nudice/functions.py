@@ -1,26 +1,23 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# internal workings of the code!
+"""Numerical Lindblad evolution utilities for neutrino oscillations.
+
+The module works in natural units with energies and masses expressed in eV and
+baselines expressed in eV^-1.  It evolves one density matrix per energy bin in
+mass space.  Dissipation is supplied by the caller through general Lindblad
+operators instead of being hard-coded to a visible-neutrino-decay model.
+"""
 
 # this code runs internally with eV so these might be useful
 meter = 5.06773093741e6        # [eV^-1/m]
 km    = 1.0e3*meter            # [eV^-1/km]
 MeV   = 1.0e6                  # [eV/MeV]
 
-# === Standard library imports ===@===@===@===@===@===@===
-
-import math
-import os
-import time
-import warnings
-
-
 # === Third-party imports ===@===@===@===@===@===@===
 
 import numpy as np
 from odeintw import odeintw
-from scipy.integrate import quad, quad_vec
 from scipy.linalg import expm
 
 #############################################################################
@@ -47,8 +44,9 @@ def dagger(x):
         return np.transpose(np.conj(x), axes=(0, 2, 1))
     if np.ndim(x) == 4:
         return np.transpose(np.conj(x), axes=(0, 1, 3, 2))
-    else:
-        print("TOO MANY DIMENSIONS!")
+    if np.ndim(x) == 5:
+        return np.transpose(np.conj(x), axes=(0, 1, 2, 4, 3))
+    raise ValueError("dagger only supports arrays with 2 to 5 dimensions")
 
 # calc bin centres
 def calc_bin_centres(bin_edges):
@@ -78,55 +76,19 @@ def Uall(theta12, theta23, theta13, deltaCP):
                                [0,    0,   1]]))
     return U
 
-# rho_m =  U_dagger * rho_m * U (for neutrinos i_nu == 0)
-def flav_to_mass(rho, U, i_nu):
+# rho_m =  U_dagger * rho_f * U (for neutrinos i_nu == 0)
+def flav_to_mass(rho, U, i_nu=0):
 
     if i_nu == 0:
         return np.linalg.multi_dot((dagger(U), rho, U))
-    else:
-        return np.linalg.multi_dot((U, rho, dagger(U)))
+    return np.linalg.multi_dot((U, rho, dagger(U)))
 
 # rho_f = U * rho_m * U_dagger (for neutrinos i_nu == 0)
-def mass_to_flav(rho, U, i_nu):
+def mass_to_flav(rho, U, i_nu=0):
 
     if i_nu == 0:
         return np.linalg.multi_dot((U, rho, dagger(U)))
-    else:
-        return np.linalg.multi_dot((dagger(U), rho, U))
-    
-
-# === Neutrino decay formulas ===@===@===@===@===@===@===
-
-# useful decay functions
-def f(x): return 0.5 * x + 2 + 2 * np.log(x) / x - 2 / sq(x) - 0.5 / cube(x)
-def h(x): return 0.5 * x - 2 + 2 * np.log(x) / x + 2 / sq(x) - 0.5 / cube(x)
-def k(x): return 0.5 * x - 2 * np.log(x) / x - 0.5 / cube(x)
-
-# decay width for helicity Conserving decay
-def gam_c(mi, mj, Ei, g_s, g_ps):
-    x = mi / mj
-    g = (mi * mj / (16 * np.pi * Ei)) * (sq(g_s) * f(x) + sq(g_ps) * h(x))
-    return g * ht(x - 1)
-
-# decay width for helicity Violating decay
-def gam_v(mi, mj, Ei, g_s, g_ps):
-    x = mi / mj
-    g = (mi * mj / (16 * np.pi * Ei)) * (sq(g_s) + sq(g_ps)) * k(x)
-    return g * ht(x - 1)
-
-# differential partial width for helicity Conserving decay
-def wgam_c(mi, mj, Ei, Ej, g_s, g_ps):
-    x = mi / mj
-    A = (1 / x) * (Ei / Ej) + x * (Ej / Ei)
-    Wg = (mi * mj / (16 * np.pi * sq(Ei))) * (sq(g_s) * (A + 2) + sq(g_ps) * (A - 2))  
-    return Wg * ht(x - 1) * ht(sq(x) * Ej - Ei) * ht(Ei - Ej)
-
-# differential partial width for helicity Violating decay
-def wgam_v(mi, mj, Ei, Ej, g_s, g_ps):
-    x = mi / mj
-    A = (1 / x) * (Ei / Ej) + x * (Ej / Ei)
-    Wg = (mi * mj / (16 * np.pi * sq(Ei))) * (sq(g_s) + sq(g_ps)) * (1 / x + x - A) 
-    return Wg * ht(x - 1) * ht(sq(x) * Ej - Ei) * ht(Ei - Ej)
+    return np.linalg.multi_dot((dagger(U), rho, U))
 
 
 # === Open Quantum System Machinery ===@===@===@===@===@===@===
@@ -141,84 +103,145 @@ def s2c(matrix):
 def c2k(matrix):
     M = matrix.shape[0]
     L = int(np.sqrt(M))
-    
+
     # real eigenvalues, sorted ascending, orthonormal evecs
     eigenvalues, eigenvectors = np.linalg.eigh(matrix)
-    
+
     # ignore tiny eigenvalues
-    tol = eigenvalues[-1] * 1e-10
+    tol = max(eigenvalues[-1], 1.0) * 1e-10
     mask = eigenvalues > tol
     eigenvalues = eigenvalues[mask]
-    eigenvectors = eigenvectors[:, mask] 
-    
+    eigenvectors = eigenvectors[:, mask]
+
     # build all Kraus operators at once
     kraus = (np.sqrt(eigenvalues) * eigenvectors).T.reshape(-1, L, L)
     kraus = np.swapaxes(kraus, 1, 2)
-    
+
     return list(kraus)
 
-# create Lindblad operators
-def lindblad_operators(e_edges, masses, g_s, g_ps, channel):
-    
-    for name in channel:
-        if not (name.count('->') == 1):
-            raise ValueError(f"Channel key '{name}' must contain exactly one '->'.")
-        parent, daughter = name.split('->')
-        if not (parent[0] in ('n', 'a') and daughter[0] in ('n', 'a')):
-            raise ValueError(f"Channel key '{name}': parent and daughter must start with 'n' or 'a'.")
+
+def _hamiltonian(e_edges, masses, hamiltonian=None):
+    """Build the vacuum Hamiltonian or validate a user-supplied Hamiltonian."""
 
     e_centr = calc_bin_centres(e_edges)
     n_bins  = len(e_centr)
-    Ndim    = len(masses)           
-    
-    par_indx = sorted({v["index_p"] for v in channel.values()})
-    par_dict = {p: slot for slot, p in enumerate(par_indx)}
+    Ndim    = len(masses)
 
-    A = np.zeros((len(par_indx), n_bins, n_bins, Ndim, Ndim), dtype=np.complex128)
-    
-    for c, (chan, data) in enumerate(channel.items()):
-        for ini in range(n_bins):
-            for fin in range(n_bins):
-                
-                i, j   = data["index_p"], data["index_d"]
-                mi, mj = masses[i], masses[j]
-                x_     = mi / mj
-                E_lo   = max(e_edges[fin],     e_centr[ini] / sq(x_))
-                E_hi   = min(e_edges[fin + 1], e_centr[ini])
-                
-                parent, daughter = chan.split('->')
-                hv   = parent[0] != daughter[0]     # check if decay is helicity conserving/violating
-                wgam = wgam_v if hv else wgam_c
-                ans    = quad_vec(lambda Ej: wgam(mi, mj, e_centr[ini], Ej, g_s, g_ps), E_lo, E_hi)[0]
-                A[par_dict[i], ini, fin, j, i] = np.sqrt(ans)
-                
-                                                     # L        (Npar, NE, NE, Nnu, Nnu)
-    Adag     = [dagger(A_) for A_ in A]              # L^†      (NE, NE, Nnu, Nnu)                    
-    sumAdagA = np.matmul(Adag, A).sum(axis=(0, 2))   # Sum L^†L (NE, Nnu, Nnu)
+    if hamiltonian is None:
+        H = np.zeros((n_bins, Ndim, Ndim), dtype=np.complex128)
+        for k, m in enumerate(masses):
+            H[:, k, k] = (sq(m) - sq(masses[0])) / (2 * e_centr)
+        return H
 
-    return A, Adag, sumAdagA
+    H = np.asarray(hamiltonian, dtype=np.complex128)
+    if H.shape == (Ndim, Ndim):
+        return np.broadcast_to(H, (n_bins, Ndim, Ndim)).copy()
+    if H.shape == (n_bins, Ndim, Ndim):
+        return H
+    raise ValueError(
+        "hamiltonian must have shape (Ndim, Ndim) or "
+        "(n_bins, Ndim, Ndim)."
+    )
+
+
+def lindblad_operators(e_edges, masses, operators=None):
+    """Create and validate general Lindblad operators for each energy bin.
+
+    Parameters
+    ----------
+    e_edges : array-like, shape (n_bins + 1,)
+        Energy bin edges.
+    masses : array-like, shape (Ndim,)
+        Neutrino masses.  Only the length is used here; masses define the state
+        dimension shared by the Hamiltonian and density matrices.
+    operators : None, array-like, callable, or dict
+        General Lindblad jump/decoherence operators in the mass basis.
+
+        Accepted forms are:
+
+        * ``None``: no dissipative terms, giving unitary oscillation.
+        * ``(Ndim, Ndim)``: one operator shared by all energy bins.
+        * ``(N_ops, Ndim, Ndim)``: several operators shared by all bins.
+        * ``(n_bins, N_ops, Ndim, Ndim)``: energy-dependent operators.
+        * callable ``operators(E, bin_index, Ndim)`` returning any of the first
+          three non-``None`` array forms for that bin.
+        * dict mapping labels to matrices or callables.  Each value follows the
+          same rules as above, and all values are concatenated along the
+          operator axis.
+
+    Returns
+    -------
+    L_ops : ndarray, shape (n_bins, N_ops, Ndim, Ndim)
+        Lindblad operators for every energy bin.
+    L_dag : ndarray, shape (n_bins, N_ops, Ndim, Ndim)
+        Hermitian adjoints of ``L_ops``.
+    sum_LdagL : ndarray, shape (n_bins, Ndim, Ndim)
+        Per-bin sum of ``L_a^† L_a``.
+    """
+
+    e_centr = calc_bin_centres(e_edges)
+    n_bins  = len(e_centr)
+    Ndim    = len(masses)
+
+    def normalize_array(value, *, per_bin=False):
+        arr = np.asarray(value, dtype=np.complex128)
+        if arr.shape == (Ndim, Ndim):
+            return arr.reshape(1, Ndim, Ndim) if per_bin else np.broadcast_to(
+                arr, (n_bins, 1, Ndim, Ndim)
+            ).copy()
+        if arr.ndim == 3 and arr.shape[1:] == (Ndim, Ndim):
+            return arr if per_bin else np.broadcast_to(
+                arr, (n_bins, *arr.shape)
+            ).copy()
+        if not per_bin and arr.ndim == 4 and arr.shape[0] == n_bins and arr.shape[2:] == (Ndim, Ndim):
+            return arr
+        raise ValueError(
+            "Lindblad operators must have shape (Ndim, Ndim), "
+            "(N_ops, Ndim, Ndim), or (n_bins, N_ops, Ndim, Ndim)."
+        )
+
+    if operators is None:
+        L_ops = np.zeros((n_bins, 0, Ndim, Ndim), dtype=np.complex128)
+    elif callable(operators):
+        per_bin_ops = []
+        for i, E in enumerate(e_centr):
+            per_bin_ops.append(normalize_array(operators(E, i, Ndim), per_bin=True))
+        n_ops = {ops.shape[0] for ops in per_bin_ops}
+        if len(n_ops) != 1:
+            raise ValueError("callable operators must return the same number of operators for each bin.")
+        L_ops = np.stack(per_bin_ops, axis=0)
+    elif isinstance(operators, dict):
+        pieces = [lindblad_operators(e_edges, masses, value)[0] for value in operators.values()]
+        L_ops = np.concatenate(pieces, axis=1) if pieces else np.zeros((n_bins, 0, Ndim, Ndim), dtype=np.complex128)
+    else:
+        L_ops = normalize_array(operators)
+
+    L_dag = dagger(L_ops)
+    sum_LdagL = np.einsum('baji,bajk->bik', L_dag, L_ops)
+
+    return L_ops, L_dag, sum_LdagL
 
 # the RHS of the master equation ODE - solved at every step, L
-def master_eqn(p_flat, L, H, A, Adag, sumAdagA):
+def master_eqn(p_flat, baseline, H, L_ops, L_dag, sum_LdagL):
 
     n_bins = len(H)
     Ndim   = H.shape[-1]
 
     p  = p_flat.reshape(n_bins, Ndim, Ndim)
     dp = np.zeros((n_bins, Ndim, Ndim), dtype=np.complex128)
-     
-    dp += -1j * (np.matmul(H, p) - np.matmul(p, H))       
-    dp -= 0.5 * (sumAdagA @ p + p @ sumAdagA)                
-    dp += (A @ (p[None, :, None] @ Adag)).sum(axis=(0, 1))
+
+    dp += -1j * (np.matmul(H, p) - np.matmul(p, H))
+    if L_ops.shape[1] != 0:
+        dp -= 0.5 * (sum_LdagL @ p + p @ sum_LdagL)
+        dp += np.einsum('baij,bajk,bakl->bil', L_ops, p[:, None], L_dag)
 
     return dp.ravel()
 
 # the unravelled master equation - returns the dynamical map
-def unravelled_master_eqn(L, H, A, Adag, sumAdagA):
+def unravelled_master_eqn(L, H, L_ops, L_dag, sum_LdagL):
 
     n_bins = len(H)
     Ndim   = H.shape[-1]
-    Npar   = A.shape[0]
 
     L_super = np.zeros((sq(Ndim) * n_bins, sq(Ndim) * n_bins), dtype=np.complex128)
 
@@ -226,209 +249,107 @@ def unravelled_master_eqn(L, H, A, Adag, sumAdagA):
 
     for n in range(n_bins):
         block  = -1j * (np.kron(np.eye(Ndim), H[n]) - np.kron(H[n].T, I))
-        block -= 0.5 * (np.kron(I, sumAdagA[n]) + np.kron(sumAdagA[n].T, I))
+        if L_ops.shape[1] != 0:
+            block -= 0.5 * (np.kron(I, sum_LdagL[n]) + np.kron(sum_LdagL[n].T, I))
+            block += sum(np.kron(L.conj(), L) for L in L_ops[n])
         L_super[
             sq(Ndim) * n : sq(Ndim) * (n + 1),
             sq(Ndim) * n : sq(Ndim) * (n + 1),
         ] += block
 
-    for ini in range(n_bins):
-        for fin in range(n_bins):
-            L_super[
-                    sq(Ndim) * fin : sq(Ndim) * (fin + 1),
-                    sq(Ndim) * ini : sq(Ndim) * (ini + 1)
-                   ]+= sum(np.kron(A[p, ini, fin].conj(), A[p, ini, fin]) for p in range(Npar))
-
     return expm(L_super * L)
-
 
 
 # === User Functions ===@===@===@===@===@===@===
 
-def make_majorana(masses, channel):
-    """
-    Extend a Dirac decay channel dictionary to a Majorana one by doubling the state space.
-
-    The Dirac channel dictionary has keys of the form "nX->nY" (e.g. "n2->n1"), where
-    "n"("a") denotes a neutrino(antineutrino) mass eigenstate. This function produces 
-    all four Majorana channels for each Dirac channel:
-
-        nX->nY   (nu -> nu,   helicity-conserving)
-        aX->aY   (anu -> anu, helicity-conserving)
-        nX->aY   (nu -> anu,  helicity-violating)
-        aX->nY   (anu -> nu,  helicity-violating)
-
-    The doubled mass array is [m1, m2, ..., m1, m2, ...], where the first half
-    corresponds to neutrinos and the second half to antineutrinos.
+def lind(initial_value, L, e_edges, masses, operators=None, hamiltonian=None, **kwargs):
+    """Solve the Lindblad master equation by directly solving an ODE.
 
     Parameters
     ----------
-    masses (Ndim,)                     : Neutrino masses (lightest first).
-    channel                            : Decay-channel dictionary.  Each entry is a channel with
-                                         indices for both parent and daughter.
+    initial_value : ndarray, shape (n_bins, Ndim, Ndim)
+        Initial density matrix in the mass basis for each energy bin.
+    L : float
+        Propagation distance in eV^-1.
+    e_edges : array-like, shape (n_bins + 1,)
+        Energy bin edges.
+    masses : array-like, shape (Ndim,)
+        Neutrino masses.  Used to build the vacuum Hamiltonian when no custom
+        Hamiltonian is supplied.
+    operators : optional
+        General Lindblad operators accepted by ``lindblad_operators``.
+    hamiltonian : optional
+        Custom Hamiltonian with shape ``(Ndim, Ndim)`` or
+        ``(n_bins, Ndim, Ndim)``.  If omitted, the vacuum mass-basis
+        Hamiltonian is used.
+    **kwargs
+        Optional ODE settings: ``n_steps`` (default 100), ``rtol`` (default
+        1e-8), ``atol`` (default 1e-8), and ``mxstep`` (default 50_000).
 
     Returns
     -------
-    masses_maj (2*Ndim,)               : Doubled Majorana neutrino masses.
-    channel_maj                        : Doubled Majorana decay-channel dictionary.  Each entry is 
-                                         a channel with indices for both parent and daughter.
+    ndarray, shape (n_bins, Ndim, Ndim)
+        Evolved density matrix at ``L``.
     """
 
-    for name in channel:
-        if not (name.count('->') == 1):
-            raise ValueError(f"Channel key '{name}' must contain exactly one '->'.")
-        parent, daughter = name.split('->')
-        if not (parent.startswith('n') and daughter.startswith('n')):
-            raise ValueError(f"Channel key '{name}' must be of the form 'nX->nY'.")
+    H = _hamiltonian(e_edges, masses, hamiltonian)
+    L_ops, L_dag, sum_LdagL = lindblad_operators(e_edges, masses, operators)
 
-    Ndim = len(masses)
+    n_steps = kwargs.pop("n_steps", 100)
+    rtol    = kwargs.pop("rtol", 1e-8)
+    atol    = kwargs.pop("atol", 1e-8)
+    mxstep  = kwargs.pop("mxstep", 50_000)
+    if kwargs:
+        raise TypeError(f"Unexpected keyword argument(s): {', '.join(kwargs)}")
 
-    masses_maj  = list(masses) + list(masses)
-    channel_maj = {}
-    for name, data in channel.items():
-        i, j = data["index_p"], data["index_d"]
-        parent, daughter = name.split('->')
-        a_parent   = parent.replace('n', 'a')
-        a_daughter = daughter.replace('n', 'a')
-        channel_maj[name]                        = {**data}                                
-        channel_maj[f"{a_parent}->{a_daughter}"] = {"index_p": Ndim+i, "index_d": Ndim+j}  
-        channel_maj[f"{parent}->{a_daughter}"]   = {"index_p": i,      "index_d": Ndim+j}  
-        channel_maj[f"{a_parent}->{daughter}"]   = {"index_p": Ndim+i, "index_d": j}     
-        
-    return masses_maj, channel_maj
+    solution = odeintw(master_eqn, initial_value, np.linspace(0, L, n_steps),
+                       args=(H, L_ops, L_dag, sum_LdagL),
+                       rtol=rtol, atol=atol, mxstep=mxstep)
+
+    return solution[-1].reshape(H.shape)
 
 
-def lind(initial_value, L, e_edges, masses, g_s, g_ps, channel):
+def dynam(initial_value, L, e_edges, masses, operators=None, hamiltonian=None):
+    """Solve the Lindblad equation via the dynamical map.
+
+    The Liouvillian is exponentiated once and applied to the vectorized initial
+    state.  This implementation is for per-energy-bin Lindblad evolution; it
+    does not redistribute probability between energy bins.
     """
-    Solve the Lindblad master equation by directly solving ODE.
 
-    Parameters
-    ----------
-    initial_value (n_bins, Ndim, Ndim) : Initial density matrix in the mass basis, for each energy bin.   
-    L                                  : Propagation distance.   
-    e_edges (n_bins + 1,)              : Energy bin edges.
-    masses (Ndim,)                     : Neutrino masses (lightest first, doubled for Majorana).
-    g_s(g_ps)                          : Scalar(pseudoscalar) coupling.
-    channel                            : Decay-channel dictionary.  Each entry is a channel with
-                                         indices for both parent and daughter.
-    Returns
-    -------
-    ndarray (n_bins, Ndim, Ndim)       : Evolved density matrix at L, one block per energy bin.
-    """
-    
-    e_centr = calc_bin_centres(e_edges)
-    n_bins  = len(e_centr)
-    Ndim    = len(masses)                
+    H = _hamiltonian(e_edges, masses, hamiltonian)
+    L_ops, L_dag, sum_LdagL = lindblad_operators(e_edges, masses, operators)
 
-    # Hamiltonian
-    H = np.zeros((n_bins, Ndim, Ndim), dtype=np.complex128) 
-    for k, m in enumerate(masses):
-        H[:, k, k] = (sq(m) - sq(masses[0])) / (2 * e_centr)
-
-    # Lindblad operators
-    A, Adag, sumAdagA = lindblad_operators(e_edges, masses, g_s, g_ps, channel)
-
-    # solve the ODE - we have chosen 100 steps, and these tolerances
-    solution = odeintw(master_eqn, initial_value, np.linspace(0, L, 100),
-                       args=(H, A, Adag, sumAdagA),
-                       rtol=1e-8, atol=1e-8, mxstep=50_000)
-
-    return solution[-1].reshape(n_bins, Ndim, Ndim)
-
-
-def dynam(initial_value, L, e_edges, masses,  g_s, g_ps, channel):
-    """
-    Solve the Lindblad equation via the dynamical map (this is the default method).
-
-    Applies the dynamical map (obtained from the matrix exponential of the
-    Liouvillian) directly to the vectorized initial state. 
-
-    Parameters
-    ----------
-    initial_value (n_bins, Ndim, Ndim) : Initial density matrix in the mass basis, for each energy bin.   
-    L                                  : Propagation distance.   
-    e_edges (n_bins + 1,)              : Energy bin edges.
-    masses (Ndim,)                     : Neutrino masses (lightest first, doubled for Majorana).
-    g_s(g_ps)                          : Scalar(pseudoscalar) coupling.
-    channel                            : Decay-channel dictionary.  Each entry is a channel with
-                                         indices for both parent and daughter.
-    Returns
-    -------
-    ndarray (n_bins, Ndim, Ndim)       : Evolved density matrix at L, one block per energy bin.
-    """
-    
-    e_centr = calc_bin_centres(e_edges)
-    n_bins  = len(e_centr)
-    Ndim    = len(masses)
-
-    # Hamiltonian
-    H = np.zeros((n_bins, Ndim, Ndim), dtype=np.complex128)
-    for k, m in enumerate(masses):
-        H[:, k, k] = (sq(m) - sq(masses[0])) / (2 * e_centr)
-
-    # Lindblad operators
-    A, Adag, sumAdagA = lindblad_operators(e_edges, masses, g_s, g_ps, channel)
-
-    # unravel the initial density matrix
-    vec_rho = initial_value.reshape(-1)
-
-    # get the dynamical map
-    dy_map = unravelled_master_eqn(L, H, A, Adag, sumAdagA)
-
-    # solve the system
+    vec_rho = np.asarray(initial_value, dtype=np.complex128).reshape(-1)
+    dy_map = unravelled_master_eqn(L, H, L_ops, L_dag, sum_LdagL)
     solution = dy_map @ vec_rho
 
-    return solution.reshape(n_bins, Ndim, Ndim)
+    return solution.reshape(H.shape)
 
 
-def kraus(initial_value, L, e_edges, masses, g_s, g_ps, channel):
+def kraus(initial_value, L, e_edges, masses, operators=None, hamiltonian=None):
+    """Solve the Lindblad equation via the Kraus operator decomposition.
+
+    This is equivalent to ``dynam`` but converts each energy-bin dynamical-map
+    block to Kraus operators explicitly before applying it.
     """
-    Solve the Lindblad equation via the Kraus operator decomposition.
 
-    Converts the dynamical map (obtained from the matrix exponential of the
-    Liouvillian) into Kraus operators via the Choi-Jamiolkowski isomorphism
-    and applies them block-by-block.  Equivalent to 'dynam' but uses the 
-    Kraus representation explicitly, which is useful for verification or
-    downstream quantum-information analysis.
-    
-    Parameters
-    ----------
-    initial_value (n_bins, Ndim, Ndim) : Initial density matrix in the mass basis, for each energy bin.   
-    L                                  : Propagation distance.   
-    e_edges (n_bins + 1,)              : Energy bin edges.
-    masses (Ndim,)                     : Neutrino masses (lightest first, doubled for Majorana).
-    g_s(g_ps)                          : Scalar(pseudoscalar) coupling.
-    channel                            : Decay-channel dictionary.  Each entry is a channel with
-                                         indices for both parent and daughter.
-    Returns
-    -------
-    ndarray (n_bins, Ndim, Ndim)       : Evolved density matrix at L, one block per energy bin.
-    """
-    e_centr = calc_bin_centres(e_edges)
-    n_bins  = len(e_centr)
+    H = _hamiltonian(e_edges, masses, hamiltonian)
+    L_ops, L_dag, sum_LdagL = lindblad_operators(e_edges, masses, operators)
 
-    Ndim = len(masses)
+    n_bins = len(H)
+    Ndim   = H.shape[-1]
+    initial_value = np.asarray(initial_value, dtype=np.complex128)
 
-    # Hamiltonian
-    H = np.zeros((n_bins, Ndim, Ndim), dtype=np.complex128)
-    for k, m in enumerate(masses):
-        H[:, k, k] = (sq(m) - sq(masses[0])) / (2 * e_centr)
+    dy_map = unravelled_master_eqn(L, H, L_ops, L_dag, sum_LdagL)
 
-    # Lindblad operators
-    A, Adag, sumAdagA = lindblad_operators(e_edges, masses, g_s, g_ps, channel)
-
-    # get the dynamical map
-    dy_map = unravelled_master_eqn(L, H, A, Adag, sumAdagA)
-
-    # solve the system via Kraus operators
     solution = np.zeros((n_bins, Ndim, Ndim), dtype=np.complex128)
-    for ini in range(n_bins):
-        for fin in range(n_bins):
-            block = dy_map[
-                sq(Ndim) * fin : sq(Ndim) * (fin + 1),
-                sq(Ndim) * ini : sq(Ndim) * (ini + 1),
-            ]
-            for M in c2k(s2c(block)):
-                solution[fin] += M @ initial_value[ini] @ dagger(M)
+    for n in range(n_bins):
+        block = dy_map[
+            sq(Ndim) * n : sq(Ndim) * (n + 1),
+            sq(Ndim) * n : sq(Ndim) * (n + 1),
+        ]
+        for M in c2k(s2c(block)):
+            solution[n] += M @ initial_value[n] @ dagger(M)
 
     return solution
