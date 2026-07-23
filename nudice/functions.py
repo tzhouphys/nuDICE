@@ -7,6 +7,8 @@ The module works in natural units with energies and masses expressed in eV and
 baselines expressed in eV^-1.  It evolves one density matrix per energy bin in
 mass space.  Dissipation is supplied by the caller through general Lindblad
 operators instead of being hard-coded to a visible-neutrino-decay model.
+
+The automatic treatment of visible-neutrino decay with energy redistribution has been removed
 """
 
 # this code runs internally with eV so these might be useful
@@ -121,7 +123,7 @@ def c2k(matrix):
 
 
 def _hamiltonian(e_edges, masses, hamiltonian=None):
-    """Build the vacuum Hamiltonian or validate a user-supplied Hamiltonian."""
+    """Helper function to build the vacuum Hamiltonian or validate a user-supplied Hamiltonian."""
 
     e_centr = calc_bin_centres(e_edges)
     n_bins  = len(e_centr)
@@ -142,7 +144,6 @@ def _hamiltonian(e_edges, masses, hamiltonian=None):
         "hamiltonian must have shape (Ndim, Ndim) or "
         "(n_bins, Ndim, Ndim)."
     )
-
 
 def lindblad_operators(e_edges, masses, operators=None):
     """Create and validate general Lindblad operators for each energy bin.
